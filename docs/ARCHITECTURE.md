@@ -9,7 +9,7 @@ the CLI binary, and the GUI communicates with it exclusively through:
 
 - **subprocess pipes** (stdin/stdout/stderr)
 - **configuration files** on the local filesystem
-- **process signals** (SIGKILL)
+- **process signals** (SIGINT with SIGKILL fallback, or `systemctl --user stop` when a systemd service is detected)
 
 ```
 ┌─────────────────────────────────────┐
@@ -219,12 +219,24 @@ while time.time() < timeout:
     self.read_stderr()
 ```
 
-**Stopping:**
+**Stopping (subprocess mode):**
 
 ```python
 def stop_worker(self):
-    while self.onedrive_process.poll() is None:
-        self.onedrive_process.kill()   # SIGKILL
+    # SIGINT → wait up to 10 s → SIGKILL fallback (allows clean DB flush)
+    self.onedrive_process.send_signal(signal.SIGINT)
+    ...
+    self.quit()
+    self.wait()
+    self.remove_worker.emit(self.profile_name)
+```
+
+**Stopping (systemd mode):**
+
+```python
+def stop_worker(self):
+    subprocess.run(["systemctl", "--user", "stop", self.systemd_unit])
+    self.onedrive_process.terminate()   # terminates journalctl
     self.quit()
     self.wait()
     self.remove_worker.emit(self.profile_name)
@@ -463,3 +475,101 @@ read loop: readline() ──► pattern matching ──► Qt signals ──► 
 TaskList widget             Profile tab label
 (file name + progress bar)  (status text + tooltip)
 ```
+
+
+---
+
+## Gap Analysis: Recommended Architecture vs. Actual Implementation
+
+The creator of the `abraunegg/onedrive` CLI stated the following recommendation for GUI front-ends:
+
+> **If a systemd service is enabled**, monitor the status of that, looking at the systemd logs
+> to understand what is going on. To stop the service on system shutdown/suspend, issue a
+> systemd service command to stop that service.
+>
+> **If a systemd service is not enabled**, start a `onedrive --monitor --verbose` instance and
+> use the logging to understand what is going on. To stop the service on system
+> shutdown/suspend, issue a Ctrl-C (SIGINT) to allow all shutdown handling, process cleanup,
+> and clean DB shutdown.
+
+### Gap 1 — No systemd awareness
+
+OneDriveGUI has **zero systemd detection**. Regardless of whether the user has
+`systemctl --user enable onedrive@<profile>.service`, the GUI always forks a new
+subprocess with `onedrive --monitor -v`.
+
+**Consequence:** The user must manually stop their systemd-managed service before the
+GUI will work, because both the GUI subprocess and the systemd service attempt to own
+the same SQLite state database. The `"application is already running"` check in
+`read_stdout()` was explicitly commented out, so this conflict is silently swallowed.
+
+### Gap 2 — SIGKILL instead of SIGINT
+
+`WorkerThread.stop_worker()` uses `process.kill()` which sends **SIGKILL** — no graceful shutdown.
+Similarly, the auth-detection branch in `read_stdout()` kills the process with SIGKILL.
+
+**Consequence:** The `onedrive` binary has no opportunity to flush its SQLite state
+database, write its sync state, or perform other cleanup. This is the likely root cause
+of users needing `--resync` after closing the GUI.
+
+The CLI author's recommendation is **SIGINT** (Ctrl-C equivalent), which triggers
+the client's built-in shutdown handler.
+
+---
+
+## Implementation Plan (Changes Required)
+
+### Change 1 — Systemd unit detection
+
+Add `_detect_systemd_unit()` to `WorkerThread`. It checks the following candidate unit
+names in priority order using `systemctl --user is-enabled`:
+
+1. `onedrive@<profile_name>.service` — standard multi-account pattern
+2. `onedrive@<config_dir_basename>.service` — alternative naming
+3. `onedrive.service` — default single-account service
+
+If any candidate exits with code 0 (`enabled`), that unit name is stored as
+`self.systemd_unit` and `self.systemd_mode = True`. If systemd is unavailable
+(FileNotFoundError, timeout), detection returns `None` and subprocess mode is used.
+
+### Change 2 — Systemd monitoring mode
+
+Add `_start_systemd_monitoring()` to `WorkerThread`:
+
+1. Check if unit is active (`systemctl --user is-active`). If not, start it.
+2. Launch `journalctl --user -u <unit> -f --output=cat -n 0` as the monitored process.
+   `--output=cat` strips journal metadata so the existing `read_stdout()` parser works
+   without modification. `-n 0` starts with no history, only future log lines.
+
+The existing read loop `while self.onedrive_process.poll() is None: self.read_stdout()`
+then works identically for both subprocess and systemd modes.
+
+### Change 3 — SIGINT shutdown (subprocess mode)
+
+Replace `process.kill()` (SIGKILL) with a graceful SIGINT then SIGKILL fallback in
+`stop_worker()` and in `read_stdout()` auth detection.
+
+### Change 4 — Systemd stop on shutdown/suspend
+
+`stop_worker()` branches on `self.systemd_mode`:
+
+- **Systemd mode:** `systemctl --user stop <unit>` then terminate the `journalctl` process
+- **Subprocess mode:** SIGINT then SIGKILL (Change 3)
+
+This satisfies the CLI author's requirement to issue a systemd service command to stop
+the service on shutdown.
+
+### Affected files
+
+| File | Changes |
+|---|---|
+| `src/workers.py` | All four changes above |
+| `docs/ARCHITECTURE.md` | This gap analysis section (documentation only) |
+
+### Unchanged behaviour
+
+- All UI interactions (start/stop buttons, tray icon, version checks)
+- Output parsing (`read_stdout()` is identical for both modes)
+- Authentication flow (MaintenanceWorker still handles `--auth-response`)
+- SharePoint / shared-folder operations
+- Profile configuration and settings dialogs
