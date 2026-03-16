@@ -42,7 +42,7 @@ from options import (
 )
 
 from utils.utils import humanize_file_size, shorten_path, format_relative_time
-from workers import WorkerThread, MaintenanceWorker, TaskList, workers
+from workers import WorkerThread, MaintenanceWorker, TaskList, workers, get_enabled_systemd_unit
 from gui_settings_window import gui_settings_window
 
 import logging
@@ -223,6 +223,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.scroll_update_timer.timeout.connect(self.update_relative_times)
         self.scroll_update_timer.setInterval(200)  # 200ms debounce delay
 
+        # Timer that detects when a systemd-managed OneDrive service is started by a
+        # third party (i.e. not via the GUI's Start button) so the GUI can attach a
+        # worker and reflect the real service state.
+        self.systemd_external_check = QTimer()
+        self.systemd_external_check.setSingleShot(False)
+        self.systemd_external_check.timeout.connect(self._check_externally_started_services)
+        self.systemd_external_check.start(30000)  # Every 30 seconds
+
     def mousePressEvent(self, event):
         if gui_settings.get("frameless_window") == "True":
             self.dragPos = event.globalPosition().toPoint()
@@ -259,15 +267,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         if close_question == QMessageBox.Yes:
             logging.info("Quitting OneDriveGUI")
-            workers_to_stop = list(workers.keys())
-
             # Keep thread references before initiating stops.  stop_worker() no longer
             # calls self.wait(), so threads finish asynchronously; we need the refs to
             # wait for them below.
-            thread_refs = [workers[w] for w in workers_to_stop]
+            thread_refs = list(workers.values())
 
-            for worker in workers_to_stop:
-                workers[worker].stop_worker()
+            for thread in thread_refs:
+                thread.stop_worker()
 
             # Block until every thread has truly finished before calling sys.exit().
             for thread in thread_refs:
@@ -1177,6 +1183,42 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         logging.info(f"[{profile_name}] Removing thread info")
         workers.pop(profile_name, None)
         logging.info(f"[GUI] Remaining running workers: {workers}")
+
+    def _check_externally_started_services(self):
+        """
+        Periodically check whether any systemd-managed OneDrive service became active
+        outside the GUI (e.g. the user ran 'systemctl --user start onedrive').
+        If a service is active but has no corresponding GUI worker, a worker is
+        auto-started so that the indicator, button, and status text update correctly.
+        """
+        for profile_name in list(global_config):
+            # Skip profiles that already have a running GUI worker.
+            if profile_name in workers and workers[profile_name].isRunning():
+                continue
+
+            config_file = global_config.get(profile_name, {}).get("config_file", "")
+            if not config_file:
+                continue
+
+            unit = get_enabled_systemd_unit(profile_name, config_file)
+            if unit is None:
+                continue  # Not a systemd-managed profile; nothing to do.
+
+            try:
+                result = subprocess.run(
+                    ["systemctl", "--user", "is-active", unit],
+                    capture_output=True,
+                    text=True,
+                    timeout=1,
+                )
+                if result.stdout.strip() == "active":
+                    logging.info(
+                        f"[{profile_name}] Systemd service '{unit}' is active but has no "
+                        f"GUI worker — auto-starting worker to track it."
+                    )
+                    self.start_onedrive_monitor(profile_name)
+            except Exception as e:
+                logging.debug(f"[{profile_name}] External start check failed: {e}")
 
     def add_profile(self, profile_name):
         """
