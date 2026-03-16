@@ -8,7 +8,10 @@ from PySide6.QtGui import QFontMetrics, QIcon
 from ui.ui_list_item_widget import Ui_list_item_widget
 
 
+import os
 import re
+import select
+import signal
 import time
 import subprocess
 from datetime import datetime
@@ -31,6 +34,53 @@ import logging
 
 # from logger import logger
 from global_config import DIR_PATH, PROFILES_FILE
+
+
+# ---------------------------------------------------------------------------
+# Standalone systemd helpers (usable without a WorkerThread instance)
+# ---------------------------------------------------------------------------
+
+
+def get_enabled_systemd_unit(profile_name: str, config_file: str) -> str | None:
+    """
+    Return the name of the first *enabled* systemd user service for the given
+    profile, or None if no enabled unit is found or systemd is unavailable.
+
+    Candidates are checked in priority order:
+      1. onedrive@<profile_name>.service       (multi-account setup)
+      2. onedrive@<config_dir_basename>.service (alternative naming)
+      3. onedrive.service                       (default single-account service)
+    """
+    config_dir = os.path.dirname(config_file)
+    if not config_dir:
+        return None
+    config_dir_basename = os.path.basename(config_dir)
+    seen: set[str] = set()
+    candidates = [
+        f"onedrive@{profile_name}.service",
+        f"onedrive@{config_dir_basename}.service",
+        "onedrive.service",
+    ]
+    for unit in candidates:
+        if unit in seen:
+            continue
+        seen.add(unit)
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "is-enabled", unit],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if result.returncode == 0:
+                return unit
+        except (FileNotFoundError, OSError):
+            logging.debug(f"[{profile_name}] systemctl not available; using subprocess mode")
+            return None
+        except subprocess.TimeoutExpired:
+            logging.debug(f"[{profile_name}] systemctl timed out; using subprocess mode")
+            return None
+    return None
 
 
 class WorkerThread(QThread):
@@ -58,20 +108,74 @@ class WorkerThread(QThread):
         logging.info(f"[GUI] Monitoring command: '{self._command}'")
         self.profile_name = profile
 
-    def stop_worker(self):
-        logging.info(f"[{self.profile_name}] Waiting for worker to finish...")
-        while self.onedrive_process.poll() is None:
-            self.onedrive_process.kill()
+        # Detect whether an enabled systemd user service exists for this profile.
+        self.systemd_unit = self._detect_systemd_unit()
+        self.systemd_mode = self.systemd_unit is not None
+        if self.systemd_mode:
+            logging.info(f"[{profile}] Systemd mode: using enabled unit '{self.systemd_unit}'")
+        else:
+            logging.info(f"[{profile}] Subprocess mode: no enabled systemd unit found")
 
+    # ------------------------------------------------------------------
+    # Systemd unit detection
+    # ------------------------------------------------------------------
+
+    def _detect_systemd_unit(self):
+        """
+        Detect whether there is an enabled systemd user service for this profile.
+        Delegates to the module-level get_enabled_systemd_unit() helper.
+
+        Returns the first enabled unit name, or None if systemd is unavailable
+        or no enabled unit is found (falling back to subprocess mode).
+        """
+        return get_enabled_systemd_unit(self.profile_name, self.config_file)
+
+    # ------------------------------------------------------------------
+    # Worker lifecycle
+    # ------------------------------------------------------------------
+
+    def stop_worker(self):
+        logging.info(f"[{self.profile_name}] Stopping worker...")
+        if self.systemd_mode:
+            # Ask systemd to stop the service cleanly (equivalent to Ctrl-C for the service)
+            logging.info(f"[{self.profile_name}] Stopping systemd unit '{self.systemd_unit}'")
+            try:
+                subprocess.run(
+                    ["systemctl", "--user", "stop", self.systemd_unit],
+                    timeout=15,
+                )
+            except Exception as e:
+                logging.error(f"[{self.profile_name}] Error stopping systemd unit: {e}")
+            # Terminate the journalctl monitoring process so read_stdout()'s readline
+            # unblocks and run() can return without waiting for more journal entries.
+            if self.onedrive_process.poll() is None:
+                self.onedrive_process.terminate()
+        else:
+            # Send SIGINT first so the client can flush its state DB and exit cleanly.
+            # Fall back to SIGKILL only if the process does not exit within 10 seconds.
+            if self.onedrive_process.poll() is None:
+                logging.info(f"[{self.profile_name}] Sending SIGINT to onedrive process")
+                self.onedrive_process.send_signal(signal.SIGINT)
+                for _ in range(20):  # wait up to 10 seconds (20 × 0.5 s)
+                    if self.onedrive_process.poll() is not None:
+                        break
+                    time.sleep(0.5)
+                # Force-kill only if the process still has not exited
+                if self.onedrive_process.poll() is None:
+                    logging.warning(f"[{self.profile_name}] Process did not exit after SIGINT; sending SIGKILL")
+                    while self.onedrive_process.poll() is None:
+                        self.onedrive_process.kill()
+
+        # Tell the thread's event loop to stop.  run() does not call exec() so quit()
+        # has no effect on the Python while-loop inside run(), but it is kept here for
+        # correctness in case a subclass ever adopts Qt's event loop.
         logging.info(f"[{self.profile_name}] Quitting thread")
         self.quit()
-        self.wait()
-
-        self.remove_worker.emit(self.profile_name)
 
     def run(self, resync=False):
         """
-        Starts OneDrive and sends signals to GUI based on parsed information.
+        Starts OneDrive monitoring and sends signals to GUI based on parsed output.
+        Branches between systemd mode (journalctl) and subprocess mode (onedrive --monitor).
         """
 
         self.file_name = None
@@ -104,32 +208,141 @@ class WorkerThread(QThread):
         self.collecting_failed_files = False  # Flag to indicate we're collecting failed file lines
 
         self.msg = ""
-        self.profile_status["status_message"] = "OneDrive sync is starting..."
+
+        if self.systemd_mode:
+            self._start_systemd_monitoring()
+        else:
+            self.profile_status["status_message"] = "OneDrive sync is starting..."
+            self.update_profile_status.emit(self.profile_status, self.profile_name)
+
+            self.onedrive_process = subprocess.Popen(
+                (self._command + " --resync") if resync else self._command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                shell=True,
+                universal_newlines=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+
+            while self.onedrive_process.poll() is None:
+                if self.onedrive_process.stdout:
+                    # Capture stdout and stderr from OneDrive process.
+                    self.read_stdout()
+
+            # This helps monitor stdout and stderr for extra second after onedrive process stops. I could not find a smarter way.
+            timeout = time.time() + 1
+            while True:
+                if self.onedrive_process.stderr:
+                    self.read_stderr()
+
+                if time.time() > timeout:
+                    break
+
+    def _start_systemd_monitoring(self):
+        """
+        Start an enabled systemd user service (if not already active) and monitor its
+        log output via journalctl.  The journalctl output uses --output=cat so that log
+        lines arrive without journal metadata, allowing read_stdout() to parse them
+        identically to direct subprocess output.
+
+        Uses select() with a 5-second timeout so the read loop can periodically
+        check whether the service was stopped by a third party (i.e. not via
+        stop_worker()), ensuring the GUI always reflects the real service state.
+        """
+        # Check the current service state so we can show an appropriate initial message.
+        service_already_active = False
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "is-active", self.systemd_unit],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            service_already_active = result.stdout.strip() == "active"
+        except Exception:
+            pass
+
+        if service_already_active:
+            self.profile_status["status_message"] = (
+                f"Connecting to running OneDrive sync service ({self.systemd_unit})…"
+            )
+        else:
+            self.profile_status["status_message"] = (
+                f"Starting OneDrive sync service ({self.systemd_unit})…"
+            )
         self.update_profile_status.emit(self.profile_status, self.profile_name)
 
+        # Start the service if it is not already active.
+        if not service_already_active:
+            try:
+                logging.info(f"[{self.profile_name}] Starting systemd unit '{self.systemd_unit}'")
+                subprocess.run(
+                    ["systemctl", "--user", "start", self.systemd_unit],
+                    timeout=15,
+                )
+            except Exception as e:
+                logging.error(f"[{self.profile_name}] Error starting systemd unit: {e}")
+
+        # Monitor the service log via journalctl (no history, follow only new entries).
         self.onedrive_process = subprocess.Popen(
-            self._command + "--resync" if resync else self._command,
+            [
+                "journalctl",
+                "--user",
+                "-u", self.systemd_unit,
+                "-f",
+                "--output=cat",
+                "-n", "0",
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            shell=True,
             universal_newlines=True,
             encoding="utf-8",
             errors="replace",
         )
 
+        # Use select() with a timeout so we can periodically check whether the
+        # systemd unit was stopped by a third party.  Without this, the journalctl
+        # process continues to follow indefinitely even after the service stops,
+        # leaving the GUI stuck in the "running" state.
+        _POLL_INTERVAL_S = 5.0
         while self.onedrive_process.poll() is None:
             if self.onedrive_process.stdout:
-                # Capture stdout and stderr from OneDrive process.
-                self.read_stdout()
+                try:
+                    ready, _, _ = select.select(
+                        [self.onedrive_process.stdout], [], [], _POLL_INTERVAL_S
+                    )
+                except (OSError, ValueError):
+                    # stdout was closed (e.g. process was terminated by stop_worker())
+                    break
 
-        # This helps monitor stdout and stderr for extra second after onedrive process stops. I could not find a smarter way.
-        timeout = time.time() + 1
-        while True:
-            if self.onedrive_process.stderr:
-                self.read_stderr()
-
-            if time.time() > timeout:
-                break
+                if ready:
+                    self.read_stdout()
+                else:
+                    # Timeout – no new journal lines.  Check whether the unit is still active.
+                    try:
+                        result = subprocess.run(
+                            ["systemctl", "--user", "is-active", self.systemd_unit],
+                            capture_output=True,
+                            text=True,
+                            timeout=2,
+                        )
+                        active_state = result.stdout.strip()
+                        if active_state not in ("active", "activating", "reloading"):
+                            logging.info(
+                                f"[{self.profile_name}] Systemd unit stopped externally "
+                                f"(state: '{active_state}')."
+                            )
+                            self.profile_status["status_message"] = "OneDrive sync has stopped."
+                            self.update_profile_status.emit(self.profile_status, self.profile_name)
+                            # Terminate journalctl so the thread exits cleanly.
+                            if self.onedrive_process.poll() is None:
+                                self.onedrive_process.terminate()
+                            break
+                    except Exception as e:
+                        logging.debug(
+                            f"[{self.profile_name}] Service status check failed: {e}"
+                        )
 
     def _emit_error_status(self, full_error_message):
         """Format and emit error message with truncation and line splitting."""
@@ -218,7 +431,22 @@ class WorkerThread(QThread):
                 self.update_profile_status.emit(self.profile_status, self.profile_name)
 
             elif "authorise this application by" in stdout.lower() or "--reauth and re-authorise this client" in stdout:
-                self.onedrive_process.kill()
+                # Stop the running process so the auth flow can proceed.
+                # In systemd mode stop the service via systemctl; in subprocess mode send
+                # SIGINT for a clean shutdown (the binary needs to close its state DB).
+                if self.systemd_mode:
+                    try:
+                        subprocess.run(
+                            ["systemctl", "--user", "stop", self.systemd_unit],
+                            timeout=15,
+                        )
+                    except Exception as e:
+                        logging.error(f"[{self.profile_name}] Error stopping systemd unit for auth: {e}")
+                    if self.onedrive_process.poll() is None:
+                        self.onedrive_process.terminate()
+                else:
+                    if self.onedrive_process.poll() is None:
+                        self.onedrive_process.send_signal(signal.SIGINT)
                 self.msg = "OneDrive login is required."
                 logging.warning(f"[{self.profile_name}] {self.msg}")
                 self.profile_status["status_message"] = self.msg
