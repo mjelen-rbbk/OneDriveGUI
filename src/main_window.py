@@ -259,13 +259,19 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         if close_question == QMessageBox.Yes:
             logging.info("Quitting OneDriveGUI")
-            workers_to_stop = []
+            workers_to_stop = list(workers.keys())
 
-            for worker in workers:
-                workers_to_stop.append(worker)
+            # Keep thread references before initiating stops.  stop_worker() no longer
+            # calls self.wait(), so threads finish asynchronously; we need the refs to
+            # wait for them below.
+            thread_refs = [workers[w] for w in workers_to_stop]
 
             for worker in workers_to_stop:
                 workers[worker].stop_worker()
+
+            # Block until every thread has truly finished before calling sys.exit().
+            for thread in thread_refs:
+                thread.wait()
 
             sys.exit()
 
@@ -509,7 +515,15 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
             profile_status_page = self.profile_status_pages[profile_name]
 
-            if profile_name not in workers:
+            # Treat "worker exists but thread has finished" identically to "no worker".
+            # This covers the brief window after stop_worker() unblocks but before the
+            # QThread.finished signal has been processed by the event loop (which pops
+            # the entry from the workers dict).  Without this, the indicator and
+            # button are not updated for that one timer tick, causing intermittent
+            # stale "running" state in the UI.
+            is_running = profile_name in workers and workers[profile_name].isRunning()
+
+            if not is_running:
                 profile_status_page.label_status.setText("stopped")
                 profile_status_page.label_status.setToolTip("Sync is stopped")
                 profile_status_page.label_status.setPixmap(pixmap_stopped)
@@ -521,16 +535,15 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 profile_status_page.pushButton_start_stop.clicked.connect(profile_status_page.start_monitor)
 
             else:
-                if workers[profile_name].isRunning():
-                    profile_status_page.label_status.setText("running")
-                    profile_status_page.label_status.setToolTip("Sync is running")
-                    profile_status_page.label_status.setPixmap(pixmap_running)
+                profile_status_page.label_status.setText("running")
+                profile_status_page.label_status.setToolTip("Sync is running")
+                profile_status_page.label_status.setPixmap(pixmap_running)
 
-                    # Show Stop icon when sync is running.
-                    profile_status_page.pushButton_start_stop.setIcon(profile_status_page.stop_icon)
-                    profile_status_page.pushButton_start_stop.setToolTip("Stop Sync")
-                    profile_status_page.pushButton_start_stop.clicked.disconnect()
-                    profile_status_page.pushButton_start_stop.clicked.connect(profile_status_page.stop_monitor)
+                # Show Stop icon when sync is running.
+                profile_status_page.pushButton_start_stop.setIcon(profile_status_page.stop_icon)
+                profile_status_page.pushButton_start_stop.setToolTip("Stop Sync")
+                profile_status_page.pushButton_start_stop.clicked.disconnect()
+                profile_status_page.pushButton_start_stop.clicked.connect(profile_status_page.stop_monitor)
 
         # Update system tray icon based on aggregate status
         self.update_tray_icon()

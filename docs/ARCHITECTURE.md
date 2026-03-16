@@ -363,9 +363,10 @@ Transfer lines come in two forms:
 
 2. **Progress line** — e.g. `Uploading: dir/file.zip ... 75%  |  ETA   00:00:04`  
    Parsed with `re.search(r"(\w[Downloading|Uploading]+)\:\s+(.+?)[\.]*\s(\d{1,3})\%", stdout)`.
-   Note: `[Downloading|Uploading]` is a character class in this pattern (matching any of those
-   individual characters), but works in practice because the first character is already captured
-   by `\w` and subsequent characters of "Downloading"/"Uploading" all belong to the class.
+   Note: `[Downloading|Uploading]` in this pattern is a character class (matching single characters
+   from the set), not an alternation.  The pattern works in practice because `\w` already captures
+   the first character of "Downloading"/"Uploading" and the remaining characters happen to be in
+   the set.  The semantically correct alternation would be `(?:Downloading|Uploading)`.
 
 Both produce a `transfer_progress_new` dict that is emitted via `update_progress_new`.  The main
 window maintains a list widget of `TaskList` items that display the file icon, name, progress

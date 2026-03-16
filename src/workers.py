@@ -85,7 +85,7 @@ class WorkerThread(QThread):
         or no enabled unit is found (falling back to subprocess mode).
         """
         config_dir_basename = os.path.basename(self.config_dir.group(1))
-        seen: set = set()
+        seen: set[str] = set()
         candidates = [
             f"onedrive@{self.profile_name}.service",
             f"onedrive@{config_dir_basename}.service",
@@ -129,7 +129,8 @@ class WorkerThread(QThread):
                 )
             except Exception as e:
                 logging.error(f"[{self.profile_name}] Error stopping systemd unit: {e}")
-            # Terminate the journalctl monitoring process
+            # Terminate the journalctl monitoring process so read_stdout()'s readline
+            # unblocks and run() can return without waiting for more journal entries.
             if self.onedrive_process.poll() is None:
                 self.onedrive_process.terminate()
         else:
@@ -148,11 +149,11 @@ class WorkerThread(QThread):
                     while self.onedrive_process.poll() is None:
                         self.onedrive_process.kill()
 
+        # Tell the thread's event loop to stop.  run() does not call exec() so quit()
+        # has no effect on the Python while-loop inside run(), but it is kept here for
+        # correctness in case a subclass ever adopts Qt's event loop.
         logging.info(f"[{self.profile_name}] Quitting thread")
         self.quit()
-        self.wait()
-
-        self.remove_worker.emit(self.profile_name)
 
     def run(self, resync=False):
         """
@@ -198,7 +199,7 @@ class WorkerThread(QThread):
             self.update_profile_status.emit(self.profile_status, self.profile_name)
 
             self.onedrive_process = subprocess.Popen(
-                self._command + " --resync" if resync else self._command,
+                (self._command + " --resync") if resync else self._command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 shell=True,
